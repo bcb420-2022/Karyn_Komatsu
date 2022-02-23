@@ -1,0 +1,308 @@
+---
+title: "Assignment 1"
+author: 'Karyn Komatsu #1006035238'
+output:
+  html_document:
+    df_print: paged
+---
+
+# Finding RNASeq Data
+
+## SetUp workspace
+
+```{r SetUp}
+
+# Install Packages
+if (! requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (! requireNamespace("GEOmetadb", quietly = TRUE)) {
+  install.packages("GEOmetadb")
+}
+if (!requireNamespace("biomaRt", quietly = TRUE)){
+  BiocManager::install("biomaRt")
+}
+if (!requireNamespace("skimr", quietly = TRUE)){
+  BiocManager::install("skimr")
+}
+
+# Load Packages
+library(BiocManager)
+library(GEOmetadb)
+library(DBI)
+library(biomaRt)
+library(skimr)
+
+# Specify download option
+options(download.file.method = "curl")
+#BiocManager::install("geneLenDataBase")
+
+# Set Up GEOmetadb: get meta data
+if(!file.exists('GEOmetadb.sqlite')){
+  getSQLiteFile()
+}
+
+# Connect to the newly downloaded GEOmeta database
+con <- dbConnect(SQLite(), "GEOmetadb.sqlite")
+dbListFields(con, 'gse')
+
+```
+
+
+## Find Data with Supplementary COUNT File
+
+**We are looking for RNASeq data...**
+* Associated with publication
+* Within at least 10 years
+* Human cells comparing 2 conditions, with at least 3 biological replicates for each condition (ie. Min. sample size of 3 for each condition)
+* Has supplemental "counts" file associated (NOT RAW file!)
+
+First, we use the GEOmetadb to get a list of RNASeq data that contains supplementary counts file.
+
+```{r Explore Data, warning=FALSE, message=FALSE}
+# Look for RNA Seq data
+
+## Use tech tag: high-throughput sequencing
+## Ensure it involves "Homo sapiens" 
+## Ensure recent submission date and order from recent to old
+
+sql <- paste("SELECT DISTINCT gse.title, gse.gse, gpl.title,",
+             " gse.submission_date,",
+             " gse.supplementary_file",     # HAS count file
+             "FROM",
+             "  gse JOIN gse_gpl ON gse_gpl.gse=gse.gse",
+             "  JOIN gpl ON gse_gpl.gpl=gpl.gpl",
+             "WHERE",
+             "  gse.submission_date > '2015-01-01' AND",
+             "  gse.title LIKE '%diabetes%' AND",
+             "gpl.organism LIKE '%Homo sapiens%' AND",
+             "  gpl.technology = 'high-throughput sequencing' ",
+             "  ORDER BY gse.submission_date DESC",
+             sep = " ")
+
+rs <- dbGetQuery(con, sql)
+dim(rs)
+
+
+
+# Find supplementary files that has to do with "counts" 
+count_files <- rs$supplementary_file[grep(rs$supplementary_file, 
+                                          pattern = "count",
+                                          ignore.case = T)]
+
+# Show 10 with most recent submission date
+unlist(lapply(count_files,
+              FUN = function(x){
+                x <- unlist(strsplit(x, ";"));
+                x <- x[grep(x, pattern="txt", ignore.case = T)];
+                tail(unlist(strsplit(x, "/")), n=1)
+              })) [1:10]
+```
+
+After exploring the publications associated with the 10 files above (and playing around with the code, changing the keywords etc.) we have found an interesting publication that satisfies the requirements for data.
+
+# Data Cleaning
+
+```{r, message=FALSE, warning=FALSE}
+
+# Get ALL supplemental files
+
+sfiles = getGEOSuppFiles('GSE162689')
+
+
+# See all the names of supplemental files
+fnames = rownames(sfiles)
+
+# Read downloaded supplemental file
+counts_txt = read.delim(fnames[2], 
+                        header = TRUE,
+                        check.names = FALSE)
+
+# Omit NA Data before finding cpms (as NA cause error in cpm)
+counts_txt <- counts_txt[-c(1), ]  # Delete 1st row (identifier)
+counts_txt <- na.omit(counts_txt) # Omit NA's
+
+# Translate to cpms
+cpms <- edgeR::cpm(counts_txt[,2:ncol(counts_txt)])
+rownames(cpms) <- counts_txt[,1]
+
+# Filter low counts using cpm
+keep <- rowSums(cpms>1) >= 10
+counts_filtered <- counts_txt[keep,]
+
+# See only the genes with total (cpm >=1) >= 10
+knitr::kable(head(counts_filtered[,1:8], format = "html"), caption = "Head of Dataset with Significant CPM")
+```
+
+Now, since some of the records have no Gene symbols , we remove these observations. (NOTE: instead of HUGO, some rows have date of when the samples were read and measured as their "Title" column value. So when other records have HUGO symbols as the Title, like "AZI2", few of the records had dates like "10-Mar" instead. We removed these.)
+
+```{r Removing non-gene associated records}
+# Pattern: Date format
+bad_index <- grep(pattern = "^[0-9]{1,2}[-]{1}[A-Z]{1}[a-z]{2,3}", x=counts_filtered$Title)
+
+# Remove
+counts_filtered <- counts_filtered[-(bad_index),]
+
+skimr::skim(counts_filtered)
+```
+
+We see that the data is quite complete, with all 59 of replicates having complete rate of 1, meaning that there is no missing data. The records with NA were removed successfully.
+
+Now, we noticed that the row names assigned are already in the HUGO gene symbol. Since the symbols are already assigned, we will move onto the step of cleaning the dataset further, by excluding outliers and removing duplicates.
+
+We first search for duplicate gene symbols within the dataset:
+```{r Remove Duplicate Gene}
+# Number of total genes in dataset
+n <- length(counts_filtered$Title)
+
+# Number of unique genes in dataset
+n_unique <- length(unique(counts_filtered$Title))
+
+# Find how many duplicate genes are there
+n-n_unique  # Equals zero (ie. NO duplicate!)
+```
+
+Then, we know that all the HUGO symbols in this dataset are unique, meaning that there are no duplicates.
+
+# Data Normalization
+
+Here we look at our data distribution and apply the appropriate normalizing method. The distribution before and after the normalization will be plotted for comparison purposes.
+
+## Pre-Normalization
+
+```{r Pre-normalization Distribution}
+
+# Find the density of log2(CPM) for each of the 59 samples
+counts_density <- apply(log2(edgeR::cpm(counts_filtered[,2:ncol(counts_txt)])), 2, density)
+
+
+# Find x and y limits window
+xlim <- 0; ylim <- 0
+for (i in 1:length(counts_density)){
+  xlim <- range(c(xlim, counts_density[[i]]$x))
+  ylim <- range(c(ylim, counts_density[[i]]$y))
+}
+
+cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+# Plot
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n", ylab = "Smooth density of log2(CPM)", main = "Pre-Normalization Data Distribution", cex.lab = 0.8)
+
+# Draw lines
+for (i in 1:length(counts_density)) 
+      lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+
+# Create data plot
+dataplot <- log2(counts_filtered[,2:60])
+
+#create legend
+legend("topright", colnames(dataplot),  
+       col=cols, lty=ltys, cex=0.75, 
+       border ="blue",  text.col = "black", 
+       merge = TRUE, bg = "white")
+
+pre_plot <- recordPlot()
+```
+
+The data seems to be normal overall, but slightly right skewed with very thin tails on the right side of the left. In contrast, left tail of the plot shows a small spike in density for most of the samples. If this spike was more dynamic, it may have been a bimodal distribution, but since this mode is significantly smaller compared to the large mode at around x = 4.5, I will claim that this data has a unimodal, normal distribution.
+
+## Apply Normalization
+
+Recall that this dataset is taken from a study that attempted to look at non-diabetic and diabete type I donors' pancreas tissues of various age range. Hence, this data is more sample-based (ie. donor based) where the read-values of each genes are likely to be affected by the sample. When technical errors occur, it is more likely to affect the measurements by donor-by-donor basis. (ex. When conducting the experiment on pancreas tissue of donor #2, the measured values could be higher than the actual values whereas measured values of that for donor #1 were generally lower than actual...etc.)
+
+Hence, **Trimmed Mean Normaliztion method** (sample-based) is applied. In otherwords, some percentage of left and right tails in the Pre-normalization distribution plot (in the previous section: "Pre-Normalization Distribution") will be cut-off for each samples (ie. each colour in the plot)
+
+```{r}
+# Create a matrix from filtered data
+filtered_matrix <- as.matrix(counts_filtered[,2:ncol(counts_filtered)])
+
+# Assign row names for each matrix (i.e. Gene symbols from "Title")
+rownames(filtered_matrix) <- counts_filtered$Title
+
+d <- edgeR::DGEList(counts = filtered_matrix, 
+                    group = colnames(counts_filtered)[2:ncol(counts_filtered)]
+                    )
+
+# Find Normalization factor
+d <- edgeR::calcNormFactors(d)
+
+# Use factor to normalize data
+normalized_cpms <- edgeR::cpm(d)
+```
+
+
+## Post-Normalization
+
+```{r}
+# Find the density of log2(CPM) for each of the 59 samples
+counts_density <- apply(log2(normalized_cpms[,2:ncol(normalized_cpms)]), 2, density)
+
+
+# Find x and y limits window
+xlim <- 0; ylim <- 0
+for (i in 1:length(counts_density)){
+  xlim <- range(c(xlim, counts_density[[i]]$x))
+  ylim <- range(c(ylim, counts_density[[i]]$y))
+}
+
+cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+# Plot
+plot(counts_density[[1]], xlim=xlim, ylim=ylim, type="n", ylab = "Smooth density of log2(CPM)", main = "Post-Normalization Data Distribution", cex.lab = 0.8)
+
+# Draw lines
+for (i in 1:length(counts_density)) 
+      lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+
+#create legend
+legend("topright", colnames(dataplot),  
+       col=cols, lty=ltys, cex=0.75, 
+       border ="blue",  text.col = "black", 
+       merge = TRUE, bg = "white")
+
+post_plot <- recordPlot()
+```
+
+
+
+# Interpret and Document
+
+Here, we answer the prompts listed in the Assignments instruction page.
+
+We also note that the selected dataset contains transcriptome analysis data, comparing the gene transcription in human pancreatic tissues (specifically, islets of Langrhans where insulin is created) of various age.
+
+**What are the control and test conditions of the dataset?**
+Control was pancreatic tissues of non-diabetes patients, and test conditions were the pancreatic tissues of type I diabetes patients. 
+
+(NOTE: Insulin hormone is created in pancreas, and this study was interested in how the gene transcription changed in pancreas over different age groups, to hopefully uncover the reason behind why increased age generally results in insulin impairment.)[2]
+
+**Why is the dataset of interest to you?**
+Diabetes is a growing problem in Canadian society. Every day, there are around 20 Canadians dying from diabetes-related symptoms and issues. Despite such casualties, the cases of diabetes are increasing every year in Canada.[1] Insulin is a hormone that controls the blood sugar levels and the body tissues' glucose intake, and understanding this hormone is thought to be the key to overcoming diabetes issue. (In fact, impairment of this hormone could even lead to diabetes: type I). 
+
+**Were there expression values that were not unique for specific genes? How did you handle these?**
+The number of genes that are unique in the dataset were the same as total number of records in the dataset. Hence, *there were no duplicates*. However, there were few records with non-genetic related titles (instead of gene symbols, they had date in the form of "1-Mar" etc.) and these records were removed.
+
+**Were there expression values that could not be mapped to current HUGO symbols?**
+Each of the genes observed in the experiment (and recorded in the dataset) were already in the form of HUGO symbol. NOTE: This was completely unintentional and coincidental. I only noticed this after entering the reading week, but I decided having HUGO symbols already should not be a negativity in conducting analysis on this data in Assignment 2 and 3, hence decided to not change the dataset. 
+
+**How many outliers were removed?**
+```{r How many outliers removed}
+20821-20812
+```
+9 outliers were removed.
+
+**How did you handle replicates?**
+Each samples were normalized via TMM method.
+
+**What is the final coverage of your dataset?**
+20812 genes.
+
+
+# References
+
+1. https://www.diabetes.ca/about-diabetes/type-1
+
+2. https://pubmed.ncbi.nlm.nih.gov/33711030/
+
